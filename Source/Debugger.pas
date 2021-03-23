@@ -29,6 +29,7 @@ uses
   ClassInfoUnit,
   ModuleNameSpaceUnit,
   uConsoleOutput,
+  JclPEImage,
   JwaPsApi;
 
 type
@@ -44,6 +45,7 @@ type
     FModuleList: TModuleList;
     FTestExeExitCode: Integer;
     FLastBreakPoint: IBreakPoint;
+    FProcessTarget: TJclPeTarget;
 
     function AddressFromVA(
       const AVA: DWORD;
@@ -127,8 +129,7 @@ uses
   I_Report,
   EmmaCoverageFileUnit,
   DebugModule,
-  JclPEImage,
-  JclFileUtils;
+  JclFileUtils, JclMapScannerHelper;
 
 function RealReadFromProcessMemory(
   const AhProcess: THANDLE;
@@ -243,16 +244,29 @@ begin
   ConsoleOutput('                       check for any units to report on');
   ConsoleOutput(I_CoverageConfiguration.cPARAMETER_EMMA_OUTPUT +
       '               -- Output emma coverage file as coverage.es in the output directory');
+  ConsoleOutput(I_CoverageConfiguration.cPARAMETER_EMMA21_OUTPUT +
+      '             -- Output emma21 coverage file as coverage.es in the output directory');
+  ConsoleOutput(I_CoverageConfiguration.cPARAMETER_EMMA_SEPARATE_META +
+      '               -- Generate separate meta and coverage files when generating emma');
+  ConsoleOutput('                       output - ''coverage.em'' and ''coverage.ec'' will be generated');
+  ConsoleOutput('                       for meta data and coverage data. NOTE: Needs -emma as well.');
+  ConsoleOutput(I_CoverageConfiguration.cPARAMETER_HTML_OUTPUT +
+      '               -- Generate html output as ''CodeCoverage_Summary.html'' in the output directory');
   ConsoleOutput(I_CoverageConfiguration.cPARAMETER_XML_OUTPUT +
       '                -- Output xml report as CodeCoverage_Summary.xml in the output directory');
-  ConsoleOutput(I_CoverageConfiguration.cPARAMETER_HTML_OUTPUT +
-      '               -- Output html report as CodeCoverage_Summary.html in the output directory');
+  ConsoleOutput(I_CoverageConfiguration.cPARAMETER_XML_LINES +
+      '           -- Adds lines coverage to the generated xml coverage output');
+  ConsoleOutput(I_CoverageConfiguration.cPARAMETER_XML_LINES_MERGE_GENERICS +
+      '        -- Combine lines coverage for multiple occurrences of the same');
+  ConsoleOutput('                       filename (especially usefull in case of generic classes)');
   ConsoleOutput(I_CoverageConfiguration.cPARAMETER_MODULE_NAMESPACE +
       ' name dll [dll2]   -- Create a separate namespace with the given name for the listed dll:s.');
   ConsoleOutput(I_CoverageConfiguration.cPARAMETER_UNIT_NAMESPACE +
       ' dll_or_exe unitname [unitname2]   -- Create a separate namespace (the namespace name will be the name of the module without extension) *ONLY* for the listed units within the module.');
   ConsoleOutput(I_CoverageConfiguration.cPARAMETER_LINE_COUNT +
-    ' [number] -- Count number of times a line is executed up to the specified limit (default 0 - disabled) (Win32 only)');
+    ' [number]       -- Count number of times a line is executed up to the specified limit (default 0 - disabled)');
+  ConsoleOutput(I_CoverageConfiguration.cPARAMETER_TESTEXE_EXIT_CODE +
+    ' [number]       -- Passthrough the exitcode of the application');
 
 end;
 
@@ -511,7 +525,7 @@ begin
   begin
     WaitOK := WaitForDebugEvent(DebugEvent, 1000);
 
-    DebugEventHandlingResult := DBG_CONTINUE;
+    DebugEventHandlingResult := DWORD(DBG_EXCEPTION_NOT_HANDLED);
 
     if WaitOK then
     begin
@@ -623,7 +637,13 @@ begin
 
           if (ModuleName = ModuleNameFromAddr) then
           begin
-            UnitName := AMapScanner.SourceNameFromAddr(MapLineNumber.VA);
+            //In the Delphi map-files we have entries like:
+            //Line numbers for Next.Account.Repository(Next.Core.Promises.pas) segment .text
+            //
+            //These refer to the file between () and to the one in front, which
+            //SourceNameFromAddr refers to. No idea if this is a bug in JCL, but
+            //we can solve our issue by refering to the unitname
+            UnitName := AMapScanner.MapStringToSourceFile(MapLineNumber.UnitName);
             if ExtractFileExt(UnitName) = '' then
               UnitName := ChangeFileExt(UnitName, '.pas');
             UnitModuleName := ExtractFileName(ChangeFileExt(UnitName, ''));
@@ -635,7 +655,13 @@ begin
               FLogManager.Log(
                 'Setting BreakPoint for module: ' + ModuleName +
                 ' unit ' + UnitName +
-                ' addr:' + IntToStr(LineIndex));
+                ' moduleName: ' + ModuleName +
+                ' unitModuleName: ' + UnitModuleName +
+                ' addr:' + IntToStr(LineIndex) +
+                ' VA:' + IntToHex(MapLineNumber.VA) +
+                ' Base:' + IntToStr(AModule.Base) +
+                ' Address: ' + IntToHex(Integer(AddressFromVA(MapLineNumber.VA, AModule.Base)))
+                );
 
               BreakPoint := FBreakPointList.BreakPointByAddress[(AddressFromVA(MapLineNumber.VA, AModule.Base))];
               if not Assigned(BreakPoint) then
@@ -737,8 +763,14 @@ begin
   try
     PEImage.FileName := ProcessName;
     Size := PEImage.OptionalHeader32.SizeOfCode;
+    FProcessTarget := PEImage.Target;
   finally
     PEImage.Free;
+  end;
+
+  if not (FProcessTarget in [taWin32, taWin64]) then begin
+    FLogManager.Log('Unknown executable type, cannot start debugging.');
+    Exit;
   end;
 
   FLogManager.Log('Create Process:' + IntToStr(ADebugEvent.dwProcessId) + ' name:' + ProcessName);
@@ -863,6 +895,7 @@ begin
       end;
 
     // Cardinal(EXCEPTION_ARRAY_BOUNDS_EXCEEDED) :
+    Cardinal(STATUS_WX86_BREAKPOINT),
     Cardinal(EXCEPTION_BreakPoint):
       begin
         BreakPoint := FBreakPointList.BreakPointByAddress[
@@ -890,7 +923,11 @@ begin
                 if GetThreadContext(DebugThread.Handle, ContextRecord) then
                 begin
                   // Rewind to previous instruction
+                  {$IFDEF CPUX64}
+                  Dec(ContextRecord.Rip);
+                  {$ELSE}
                   Dec(ContextRecord.Eip);
+                  {$ENDIF}
                   // Set TF (Trap Flag so we get debug exception after next instruction
                   ContextRecord.EFlags := ContextRecord.EFlags or $100;
                   SetThreadContext(DebugThread.Handle, ContextRecord);
@@ -904,7 +941,12 @@ begin
             end
             else
             begin
-              FLogManager.Log('BreakPoint already cleared - BreakPoint in source?');
+              FLogManager.Log('BreakPoint already cleared - multi threaded code (or breakPoint in source?)');
+
+              //Multi threaded execution of exactly the same instruction, make sure
+              //we rewind to the previous instruction (the op code is already
+              //changed in the original .Clear/.Deactivate of the breakpoint)
+              BreakPoint.Clear(DebugThread);
             end;
           end
           else
@@ -976,8 +1018,19 @@ var
   DebugThread: IDebugThread;
   Module: IDebugModule;
   MapScanner: TJCLMapScanner;
+  MachineType: Cardinal;
 begin
   ContextRecord.ContextFlags := CONTEXT_ALL;
+  case FProcessTarget of
+    taWin32:
+      MachineType := IMAGE_FILE_MACHINE_I386;
+    taWin64:
+      MachineType := IMAGE_FILE_MACHINE_AMD64;
+    else begin
+      FLogManager.Log('Unkown platform');
+      Exit;
+    end;
+  end;
 
   DebugThread := FDebugProcess.GetThreadById(ADebugEvent.dwThreadId);
 
@@ -986,15 +1039,21 @@ begin
     if GetThreadContext(DebugThread.Handle, ContextRecord) then
     begin
       FillChar(StackFrame, SizeOf(StackFrame), 0);
+      {$IFDEF CPUX64}
+      StackFrame.AddrPC.Offset := ContextRecord.Rip;
+      StackFrame.AddrFrame.Offset := ContextRecord.Rbp;
+      StackFrame.AddrStack.Offset := ContextRecord.Rsp;
+      {$ELSE}
       StackFrame.AddrPC.Offset := ContextRecord.Eip;
-      StackFrame.AddrPC.Mode := AddrModeFlat;
       StackFrame.AddrFrame.Offset := ContextRecord.Ebp;
-      StackFrame.AddrFrame.Mode := AddrModeFlat;
       StackFrame.AddrStack.Offset := ContextRecord.Esp;
+      {$ENDIF}
+      StackFrame.AddrPC.Mode := AddrModeFlat;
+      StackFrame.AddrFrame.Mode := AddrModeFlat;
       StackFrame.AddrStack.Mode := AddrModeFlat;
 
       StackWalk64(
-        IMAGE_FILE_MACHINE_I386,
+        MachineType,
         FDebugProcess.Handle,
         DebugThread.Handle,
         StackFrame,
@@ -1004,7 +1063,7 @@ begin
 
       FLogManager.Log('---------------Stack trace --------------');
       while StackWalk64(
-        IMAGE_FILE_MACHINE_I386,
+        MachineType,
         FDebugProcess.Handle,
         DebugThread.Handle,
         StackFrame,
